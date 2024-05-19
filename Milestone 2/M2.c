@@ -343,3 +343,32 @@ void executeProcess(PCB* process, int quantum) {
         }
     }
 }
+
+
+int main() {
+    // Initialize memory
+    initializeMemory();
+
+    // Allocate memory for processes
+    allocateMemory(1, 10);
+    allocateMemory(2, 20);
+    allocateMemory(3, 30);
+
+    // Create PCBs for processes
+    PCB process1 = {1, "NEW", 0, 0, 0, 10};
+    PCB process2 = {2, "NEW", 0, 0, 10, 30};
+    PCB process3 = {3, "NEW", 0, 0, 30, 60};
+
+    // Add processes to the scheduler
+    addProcess(&process1);
+    addProcess(&process2);
+    addProcess(&process3);
+
+    // Initialize the scheduler
+    initScheduler();
+
+    // Run the scheduler
+    schedule();
+
+    return 0;
+}
