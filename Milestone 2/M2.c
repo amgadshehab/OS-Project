@@ -4,9 +4,13 @@
 #include <stdlib.h>
 
 #define MEMORY_SIZE 60
+#define FREE 0
+#define USED 1
 #define MAX_PROCESSES 10
 #define BLOCK_SIZE 10
 #define NUM_QUEUES 4
+#define MAX_PROGRAM_SIZE 50
+#define TIME_QUANTUM 2
 #define TERMINATED 0 // Define the TERMINATED identifier
 #define READY 1 // Define the READY identifier
 #define BLOCKED 2 // Define the BLOCKED/WAITING identifier
@@ -21,6 +25,7 @@ typedef struct {
     int programCounter;
     int memoryLowerBound;
     int memoryUpperBound;
+     int time_slice; // To keep track of the remaining time slice
 } PCB;
 
 typedef struct {
@@ -30,13 +35,17 @@ typedef struct {
 } MemoryBlock;
 
 typedef struct {
+    int size;
+    char memory[MEMORY_SIZE][50];
     char name[50];
     int data;
-} MemoryWord;
+} Memory;
 
 typedef struct {
     char name[50];
-    int flag;
+    int locked;
+    PCB* blocked_queue[MAX_PROCESSES];
+    int blocked_count;
 } Mutex;
 
 typedef struct Process {
@@ -47,23 +56,28 @@ typedef struct Process {
 typedef struct {
     Process* front;
     Process* rear;
+    int count;
+    PCB* queue[MAX_PROCESSES];
 } Queue;
 
 typedef struct {
-    Queue queues[NUM_QUEUES];
+    PCB* ready_queues[4][MAX_PROCESSES];
+    int ready_counts[4];
+    PCB* general_blocked_queue[MAX_PROCESSES];
+    int blocked_count;
+    PCB* current_process;
     int quantum[NUM_QUEUES];
 } Scheduler;
 
 
 
+
+Queue ready_queue;
 Scheduler scheduler = { .quantum = {1, 2, 4, 8} }; // Quantum doubles for each lower priority level
 MemoryBlock memoryBlocks[MEMORY_SIZE];
-char memory[MEMORY_SIZE];
-int nextFreeBlock = 0;
-// Assuming you have an array to represent the mutexes
+int memory[MEMORY_SIZE];
 Mutex mutexes[3];
-// Assuming you have an array to represent the memory
-MemoryWord mem[100];
+Memory mem[100];
 Queue readyQueue = {NULL, NULL};
 Queue blockedQueue = {NULL, NULL};
 pthread_mutex_t mutex;
@@ -72,24 +86,35 @@ pthread_mutex_t userOutputMutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t fileAccessMutex = PTHREAD_MUTEX_INITIALIZER;
 MemoryBlock freeBlocks[MAX_PROCESSES];
 int nextFreeBlock = 0;
+char programs[MAX_PROCESSES][MAX_PROGRAM_SIZE][50];
+
+
+
+void executeCommand(char* line);
+void initScheduler(void);
+//void initializeMemory();
+void initialize_scheduler();
 
 void initializeMemory() {
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        freeBlocks[i].start = i * BLOCK_SIZE;
-        freeBlocks[i].size = BLOCK_SIZE;
+    mem->size = MEMORY_SIZE;
+    for (int i = 0; i < MEMORY_SIZE; i++) {
+        for (int j = 0; j < MEMORY_SIZE; j++) {
+            strcpy(mem[i].memory[j], "");
+        }    
     }
 }
 
-void allocateMemory(int processID, int size) {
+int allocateMemory(int processID, int size) {
     if (nextFreeBlock + size > MEMORY_SIZE) {
         printf("Not enough memory to allocate %d blocks for process %d\n", size, processID);
-        return;
+        return 0;
     }
     memoryBlocks[processID].start = nextFreeBlock;
     memoryBlocks[processID].size = size;
     memoryBlocks[processID].processID = processID;
 
     nextFreeBlock += size;
+    
 }
 
 void deallocateMemory(int processID) {
@@ -118,8 +143,36 @@ void parseFile(char* filename) {
     fclose(file);
 }
 
-void initMutex() {
-    pthread_mutex_init(&mutex, NULL);
+
+void initialize_mutexes() {
+    for (int i = 0; i < 3; i++) {
+        mutexes[i].locked = 0;
+        mutexes[i].blocked_count = 0;
+    }
+}
+
+void sem_wait(Mutex* mutex, PCB* pcb) {
+    if (!mutex->locked) {
+        mutex->locked = 1;
+    } else {
+        strcpy(pcb->state, "Blocked");
+        mutex->blocked_queue[mutex->blocked_count++] = pcb;
+    }
+}
+
+PCB* sem_signal(Mutex* mutex) {
+    if (mutex->blocked_count > 0) {
+        PCB* unblocked_process = mutex->blocked_queue[0];
+        for (int i = 1; i < mutex->blocked_count; i++) {
+            mutex->blocked_queue[i-1] = mutex->blocked_queue[i];
+        }
+        mutex->blocked_count--;
+        strcpy(unblocked_process->state, "Ready");
+        mutex->locked = 0;
+        return unblocked_process;
+    }
+    mutex->locked = 0;
+    return NULL;
 }
 
 void criticalSection(int processID) {
@@ -137,13 +190,13 @@ void destroyMutex() {
 }
 
 
-void enqueue(Queue* queue, int processID) {
+void enqueue(Queue* queue, PCB *pcb) {
     Process* newProcess = malloc(sizeof(Process));
-    newProcess->processID = processID;
+    newProcess->processID = pcb->processID;
     newProcess->next = NULL;
 
     if (queue->rear != NULL) {
-        queue->rear->next = newProcess;
+        queue->rear = newProcess;
     }
     queue->rear = newProcess;
 
@@ -169,6 +222,7 @@ int dequeue(Queue* queue) {
 
     return processID;
 }
+
 void executeCommand(char* command) {
     char* token = strtok(command, " ");
     if (strcmp(token, "readFile") == 0) {
@@ -239,7 +293,6 @@ void executeCommand(char* command) {
                 // Find an empty spot in the memory
                 for (int i = 0; i < 100; i++) {
                     if (mem[i].name[0] == '\0') {
-                        strcpy(mem[i].name, varName);
                         mem[i].data = value;
                         break;
                     }
@@ -259,8 +312,8 @@ void executeCommand(char* command) {
             // Find the mutex for the resource
             for (int i = 0; i < 3; i++) {
                 if (strcmp(mutexes[i].name, resourceName) == 0) {
-                    if (mutexes[i].flag == 0) {
-                        mutexes[i].flag = 1;
+                    if (mutexes[i].locked == 0) {
+                        mutexes[i].locked = 1;
                     } else {
                         printf("Resource %s is currently in use\n", resourceName);
                     }
@@ -295,8 +348,8 @@ void executeCommand(char* command) {
             // Find the mutex for the resource
             for (int i = 0; i < 3; i++) {
                 if (strcmp(mutexes[i].name, resourceName) == 0) {
-                    if (mutexes[i].flag == 1) {
-                        mutexes[i].flag = 0;
+                    if (mutexes[i].locked == 1) {
+                        mutexes[i].locked = 0;
                     } else {
                         printf("Resource %s is not currently in use\n", resourceName);
                     }
@@ -307,68 +360,116 @@ void executeCommand(char* command) {
             printf("No resource name specified\n");
         }
     }
-}  
+}
 
-void initScheduler() {
-    for (int i = 0; i < NUM_QUEUES; i++) {
-        scheduler.queues[i] = (Queue){NULL, NULL};
+
+void interpret(char program[MAX_PROGRAM_SIZE][50], PCB* pcb) {
+    while (pcb->programCounter < MAX_PROGRAM_SIZE && strlen(program[pcb->programCounter]) != 0) {
+        executeCommand(program[pcb->programCounter]);
+        pcb->programCounter++;
     }
+}
+
+
+void initialize_ready_queue() {
+    ready_queue.front = 0;
+    ready_queue.rear = NULL;
+    ready_queue.count = 0;
+}
+
+void add_process_to_ready_queue(PCB* pcb) {
+    int priority = pcb->currentPriority - 1;
+    scheduler.ready_queues[priority][scheduler.ready_counts[priority]++] = pcb;
+}
+
+void initialize_scheduler() {
+    for (int i = 0; i < 4; i++) {
+        scheduler.ready_counts[i] = 0;
+    }
+    scheduler.blocked_count = 0;
+    scheduler.current_process = NULL;
 }
 
 void schedule() {
-    for (int i = 0; i < NUM_QUEUES; i++) {
-        if (!isEmpty(&scheduler.queues[i])) {
-            PCB* process = dequeue(&scheduler.queues[i]);
-            executeProcess(process, scheduler.quantum[i]);
-            
-            if (process->state != TERMINATED) {
-                enqueue(&scheduler.queues[i+1], process);  // Move to lower priority queue
-            }
-            break;
+    initialize_ready_queue();
+
+    // Create and initialize PCBs
+    PCB pcbs[MAX_PROCESSES];
+    PCB* current_process = NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcbs[i].processID = i + 1;
+        strcpy(pcbs[i].state, "Ready");
+        pcbs[i].currentPriority = 1;
+        pcbs[i].programCounter = 0;
+        pcbs[i].time_slice = TIME_QUANTUM;
+        int mem_start = allocateMemory(10, sizeof(mem));
+        pcbs[i].memoryLowerBound = mem_start;
+        pcbs[i].memoryUpperBound = mem_start + 9;
+        enqueue(&ready_queue, &pcbs[i]);
+    }
+
+     while (ready_queue.count > 0) {
+        int pid = dequeue(&ready_queue);
+        current_process = &pcbs[pid - 1];
+       
+        while (ready_queue.count > 0) {
+            int pid = dequeue(&ready_queue);
+            current_process = &pcbs[pid - 1];
+            // Rest of the code...
+        }
+
+        printf("Executing process %d\n", current_process->processID);
+
+        // Execute instructions within the time slice
+        while (current_process->time_slice > 0 && current_process->programCounter < MAX_PROGRAM_SIZE && strlen(programs[current_process->processID - 1][current_process->programCounter]) != 0) {
+            executeCommand(programs[current_process->processID - 1][current_process->programCounter]);
+            current_process->programCounter++;
+            current_process->time_slice--;
+        }
+
+        // If the process is not finished, reset the time slice and re-enqueue
+        if (current_process->programCounter < MAX_PROGRAM_SIZE && strlen(programs[current_process->processID - 1][current_process->programCounter]) != 0) {
+            current_process->time_slice = TIME_QUANTUM;
+            enqueue(&ready_queue, current_process);
+            } else {
+            // Process is finished
+            deallocateMemory(current_process->memoryLowerBound);
+            printf("Process %d finished\n", current_process->processID);
         }
     }
-}
 
-void addProcess(PCB* process) {
-    enqueue(&scheduler.queues[0], process);  // New processes start in highest priority queue
 }
-
-void executeProcess(PCB* process, int quantum) {
-    process->state = RUNNING;
-    for (int i = 0; i < quantum; i++) {
-        process->programCounter++;
-        if (process->programCounter == process->memoryUpperBound) {
-            process->state = TERMINATED;
-            break;
-        }
-    }
-}
-
 
 int main() {
-    // Initialize memory
+    // Initialize memory, mutexes, and scheduler
     initializeMemory();
+  
+    
 
-    // Allocate memory for processes
-    allocateMemory(1, 10);
-    allocateMemory(2, 20);
-    allocateMemory(3, 30);
+    // Sample programs
+    char programs[MAX_PROCESSES][MAX_PROGRAM_SIZE][50] = {
+        {"assign 0 10", "assign 1 20", "printFromTo 0 1", ""},
+        {"assign 0 file.txt", "assign 1 Hello, World!", "writeFile 0 1", ""},
+        {"assign 0 file.txt", "readFile 0", ""}
+    };
 
-    // Create PCBs for processes
-    PCB process1 = {1, "NEW", 0, 0, 0, 10};
-    PCB process2 = {2, "NEW", 0, 0, 10, 30};
-    PCB process3 = {3, "NEW", 0, 0, 30, 60};
-
-    // Add processes to the scheduler
-    addProcess(&process1);
-    addProcess(&process2);
-    addProcess(&process3);
-
-    // Initialize the scheduler
-    initScheduler();
+    // Create PCBs and allocate memory for each process
+    PCB pcbs[MAX_PROCESSES];
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        pcbs[i].processID = i + 1;
+        strcpy(pcbs[i].state, "Ready");
+        pcbs[i].currentPriority = 1;
+        pcbs[i].programCounter = 0;
+        int mem_start = allocateMemory(10, sizeof(mem));
+        pcbs[i].memoryLowerBound = mem_start;
+        pcbs[i].memoryUpperBound = mem_start + 9;
+        add_process_to_ready_queue(&pcbs[i]);
+    }
 
     // Run the scheduler
-    schedule();
+    //run_scheduler(programs);
+    schedule(); 
 
     return 0;
 }
+
